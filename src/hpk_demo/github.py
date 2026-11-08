@@ -270,9 +270,12 @@ class GitHub:
         pinned = self.state.get("head_sha")
         if pinned and pinned != head:
             raise ValueError("Remote candidate SHA changed")
-        commit = self.call("GET", "/git/commits/" + head)
+        commit = self.call("GET", "/commits/" + head)
         if commit["sha"] != head or [p["sha"] for p in commit["parents"]] != [base]:
             raise ValueError("Candidate is not one direct child of the pinned base")
+        files = [(entry["filename"], entry["status"]) for entry in commit.get("files", [])]
+        if files != [(PATH, "modified")]:
+            raise ValueError("Candidate changes files outside the authorized edit")
         _, current = self.file(head)
         if current != replacement:
             raise ValueError("Refusing to overwrite a different remote commit")
