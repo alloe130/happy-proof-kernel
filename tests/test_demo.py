@@ -99,9 +99,10 @@ class MemoryGitHub(GitHub):
                     "repo": {"full_name": self.repo},
                 },
             }
-        if endpoint.startswith("/git/commits/"):
+        if endpoint.startswith("/commits/"):
             return {"sha": endpoint.rsplit("/", 1)[1],
-                    "parents": [{"sha": sha} for sha in self.parents]}
+                    "parents": [{"sha": sha} for sha in self.parents],
+                    "files": [{"filename": path, "status": "modified"} for path in self.paths]}
         if endpoint == "/pulls/1/commits":
             return [
                 {"sha": HEAD_SHA, "parents": [{"sha": sha} for sha in self.parents]}
@@ -543,6 +544,23 @@ def test_legacy_pending_pr_requires_the_pinned_head_and_replacement():
     assert api.state["pending"]["endpoint"] == "/pulls"
     assert api.publish(BASE_SHA, REPLACEMENT.encode())["pr_number"] == 1
     assert api.state["pending"] is None and api.writes == []
+
+
+def test_pending_content_with_an_extra_changed_file_never_opens_pr():
+    from hpk_demo.github import ManualReviewRequired
+
+    api = MemoryGitHub()
+    api.refs[BRANCH] = HEAD_SHA
+    api.blobs[HEAD_SHA] = REPLACEMENT.encode()
+    api.paths.append("unrelated.txt")
+    pending = {"method": "PUT", "endpoint": "/contents/" + fixture.PATH}
+    api.state = {"pending": pending}
+
+    with pytest.raises(ManualReviewRequired):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+
+    assert api.state["pending"] == pending
+    assert api.writes == []
 
 
 def test_pr_number_change_is_rejected_without_writes():
