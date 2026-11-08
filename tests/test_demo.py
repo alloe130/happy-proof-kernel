@@ -99,6 +99,10 @@ class MemoryGitHub(GitHub):
                     "repo": {"full_name": self.repo},
                 },
             }
+        if endpoint.startswith("/commits/"):
+            return {"sha": endpoint.rsplit("/", 1)[1],
+                    "parents": [{"sha": sha} for sha in self.parents],
+                    "files": [{"filename": path, "status": "modified"} for path in self.paths]}
         if endpoint == "/pulls/1/commits":
             return [
                 {"sha": HEAD_SHA, "parents": [{"sha": sha} for sha in self.parents]}
@@ -273,6 +277,24 @@ def test_oauth_mcp_handoff_and_retries_without_network(tmp_path):
                 payload(rpc(client, "verify_github_pr", verify, b))["status"]
                 == "already_verified"
             )
+            # Both publisher and verifier must reject changed remote heads,
+            # even after a successful protected check was already recorded.
+            api.refs[BRANCH] = 'c' * 40
+            assert rpc(client, "publish_git_pr", edit, a).json()["result"]["isError"]
+            assert rpc(client, "verify_github_pr", verify, b).json()["result"]["isError"]
+            api.refs[BRANCH] = HEAD_SHA
+            original_call = api.call
+
+            def moved_pr(method, endpoint="", body=None, query=None):
+                value = original_call(method, endpoint, body, query)
+                if endpoint == "/pulls/1":
+                    value["head"]["sha"] = 'c' * 40
+                return value
+
+            api.call = moved_pr
+            assert rpc(client, "publish_git_pr", edit, a).json()["result"]["isError"]
+            assert rpc(client, "verify_github_pr", verify, b).json()["result"]["isError"]
+            api.call = original_call
     finally:
         shutdown.set()
         thread.join(timeout=3)
@@ -293,3 +315,265 @@ def test_oauth_mcp_handoff_and_retries_without_network(tmp_path):
             assert action["status"] == "verified"
             events = ledger.events_for("action", action["action_id"])
             assert sum(event.event_type == "dispatch.started" for event in events) == 1
+
+@pytest.mark.parametrize('endpoint', ['/git/refs', '/contents/' + fixture.PATH, '/pulls'])
+@pytest.mark.parametrize('failure', ['timeout', 'server_error', 'invalid_json'])
+def test_lost_write_reply_reads_back_without_duplicate_write(endpoint, failure):
+    api = MemoryGitHub()
+    original = api.call
+    lost = False
+
+    def call(method, path='', body=None, query=None):
+        nonlocal lost
+        result = original(method, path, body, query)
+        if method != 'GET' and path == endpoint and not lost:
+            lost = True
+            if failure == 'server_error':
+                raise GitHubError(503, path)
+            if failure == 'invalid_json':
+                raise json.JSONDecodeError('truncated reply', '', 0)
+            raise TimeoutError('lost response')
+        return result
+
+    api.call = call
+    observed = api.publish(BASE_SHA, REPLACEMENT.encode())
+    assert observed['pr_number'] == 1 and observed['head_sha'] == HEAD_SHA
+    assert api.publish(BASE_SHA, REPLACEMENT.encode()) == observed
+    assert len(api.writes) == 3
+
+
+def test_uncertain_write_persists_manual_review_and_blocks_replay(tmp_path):
+    from hpk_demo.files import read
+
+    api = MemoryGitHub()
+    original = api.call
+
+    def call(method, path='', body=None, query=None):
+        if method == 'POST' and path == '/git/refs':
+            api.writes.append((method, path))
+            raise TimeoutError('request outcome unknown')
+        return original(method, path, body, query)
+
+    api.call = call
+    queue = tmp_path / 'queue'
+    queue.mkdir()
+    request = {'operation': 'publish', 'payload': {'replacement': REPLACEMENT}}
+    atomic(queue / '1.request.json', request)
+    service_requests(tmp_path, api, BASE_SHA)
+    result = read(queue / '1.response.json')
+    assert result['code'] == 'github_manual_review_required'
+    assert result['endpoint'] == '/git/refs'
+    # A new bridge object simulates loss of all in-memory state.
+    restarted = MemoryGitHub()
+    atomic(queue / '2.request.json', request)
+    service_requests(tmp_path, restarted, BASE_SHA)
+    assert read(queue / '2.response.json')['code'] == result['code']
+    assert len(api.writes) == 1 and restarted.writes == []
+
+
+@pytest.mark.parametrize('stage', ['file', 'pr'])
+def test_unreadable_write_reconciliation_requires_review(stage):
+    from hpk_demo.github import ManualReviewRequired
+
+    api = MemoryGitHub()
+    original = api.call
+    uncertain = False
+    target = '/contents/' + fixture.PATH if stage == 'file' else '/pulls'
+
+    def call(method, path='', body=None, query=None):
+        nonlocal uncertain
+        if uncertain and method == 'GET':
+            raise TimeoutError('read-back unavailable')
+        result = original(method, path, body, query)
+        if method != 'GET' and path == target:
+            uncertain = True
+            raise TimeoutError('reply unavailable')
+        return result
+
+    api.call = call
+    with pytest.raises(ManualReviewRequired):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+    assert len(api.writes) == (2 if stage == 'file' else 3)
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'server_error', 'incomplete', 'invalid_json'])
+@pytest.mark.parametrize('recover', [True, False])
+def test_real_http_read_retry_is_bounded(monkeypatch, failure, recover):
+    import http.client
+    import io
+    import urllib.error
+    from hpk_demo import github as module
+
+    api = GitHub('github_pat_fixture', REPO, BRANCH)
+    attempts = []
+    pauses = []
+
+    class Reply(io.StringIO):
+        status = 200
+
+    def open_request(request, timeout):
+        attempts.append((request.method, timeout))
+        if recover and len(attempts) == 3:
+            return Reply('{"private": true}')
+        if failure == 'server_error':
+            raise urllib.error.HTTPError(request.full_url, 503, 'Unavailable', {}, None)
+        if failure == 'incomplete':
+            raise http.client.IncompleteRead(b'partial')
+        if failure == 'invalid_json':
+            return Reply('{')
+        raise TimeoutError('read timed out')
+
+    monkeypatch.setattr(api.opener, 'open', open_request)
+    monkeypatch.setattr(module.time, 'sleep', pauses.append)
+    if recover:
+        assert api.call('GET') == {'private': True}
+    else:
+        with pytest.raises((TimeoutError, GitHubError, http.client.IncompleteRead, json.JSONDecodeError)):
+            api.call('GET')
+    assert attempts == [('GET', 4)] * 3
+    assert pauses == [0.2, 0.4]
+
+
+def test_real_http_never_retries_write_or_permanent_read_error(monkeypatch):
+    import urllib.error
+    api = GitHub('github_pat_fixture', REPO, BRANCH)
+    calls = []
+
+    def open_request(request, timeout):
+        calls.append(request.method)
+        if request.method == 'POST':
+            raise TimeoutError('ambiguous write')
+        raise urllib.error.HTTPError(request.full_url, 403, 'Forbidden', {}, None)
+
+    monkeypatch.setattr(api.opener, 'open', open_request)
+    with pytest.raises(TimeoutError):
+        api.call('POST', '/pulls', {})
+    with pytest.raises(GitHubError):
+        api.call('GET')
+    assert calls == ['POST', 'GET']
+
+
+def test_changed_candidate_ancestry_is_rejected_before_pr_creation():
+    api = MemoryGitHub()
+    api.refs[BRANCH] = HEAD_SHA
+    api.blobs[HEAD_SHA] = REPLACEMENT.encode()
+    api.parents = ['c' * 40]
+    with pytest.raises(ValueError, match='one direct child'):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+    assert api.writes == []
+
+
+def test_same_bytes_at_different_sha_are_not_an_authorized_replay():
+    api = MemoryGitHub()
+    api.publish(BASE_SHA, REPLACEMENT.encode())
+    api.refs[BRANCH] = 'c' * 40
+    api.blobs['c' * 40] = REPLACEMENT.encode()
+    before = list(api.writes)
+    with pytest.raises(ValueError, match='SHA changed'):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+    assert api.writes == before
+
+
+def test_process_interruption_leaves_persistent_write_gate(tmp_path):
+    api = MemoryGitHub()
+    api.state_path = tmp_path / 'write-state.json'
+    original = api.call
+
+    class ProcessStopped(BaseException):
+        pass
+
+    def call(method, path='', body=None, query=None):
+        value = original(method, path, body, query)
+        if method == 'POST':
+            raise ProcessStopped()
+        return value
+
+    api.call = call
+    with pytest.raises(ProcessStopped):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+    from hpk_demo.files import read
+    restarted = MemoryGitHub()
+    restarted.state = read(api.state_path)
+    with pytest.raises(ValueError, match='manual_review_required'):
+        restarted.publish(BASE_SHA, REPLACEMENT.encode())
+    assert restarted.writes == []
+
+
+@pytest.mark.parametrize("endpoint", ["/git/refs", "/contents/" + fixture.PATH, "/pulls"])
+def test_restart_confirms_existing_remote_write_without_resending(tmp_path, endpoint):
+    from hpk_demo.files import read
+
+    api = MemoryGitHub()
+    api.state_path = tmp_path / "write-state.json"
+    original = api.call
+
+    class ProcessStopped(BaseException):
+        pass
+
+    def call(method, path="", body=None, query=None):
+        result = original(method, path, body, query)
+        if method != "GET" and path == endpoint:
+            raise ProcessStopped()
+        return result
+
+    api.call = call
+    with pytest.raises(ProcessStopped):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+
+    # Keep the remote double, but reload the bridge state from disk.
+    api.call = original
+    api.state = read(api.state_path)
+    assert api.state["pending"]["endpoint"] == endpoint
+    observed = api.publish(BASE_SHA, REPLACEMENT.encode())
+    assert observed["head_sha"] == HEAD_SHA and observed["pr_number"] == 1
+    assert api.state["pending"] is None
+    assert api.writes == [
+        ("POST", "/git/refs"), ("PUT", "/contents/" + fixture.PATH), ("POST", "/pulls"),
+    ]
+
+
+def test_legacy_pending_pr_requires_the_pinned_head_and_replacement():
+    from hpk_demo.github import ManualReviewRequired
+
+    api = MemoryGitHub()
+    api.publish(BASE_SHA, REPLACEMENT.encode())
+    api.state = {"pending": {"method": "POST", "endpoint": "/pulls"}, "head_sha": HEAD_SHA}
+    api.writes.clear()
+    with pytest.raises(ManualReviewRequired):
+        api.publish(BASE_SHA, b"different replacement")
+    assert api.state["pending"]["endpoint"] == "/pulls"
+    assert api.publish(BASE_SHA, REPLACEMENT.encode())["pr_number"] == 1
+    assert api.state["pending"] is None and api.writes == []
+
+
+def test_pending_content_with_an_extra_changed_file_never_opens_pr():
+    from hpk_demo.github import ManualReviewRequired
+
+    api = MemoryGitHub()
+    api.refs[BRANCH] = HEAD_SHA
+    api.blobs[HEAD_SHA] = REPLACEMENT.encode()
+    api.paths.append("unrelated.txt")
+    pending = {"method": "PUT", "endpoint": "/contents/" + fixture.PATH}
+    api.state = {"pending": pending}
+
+    with pytest.raises(ManualReviewRequired):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+
+    assert api.state["pending"] == pending
+    assert api.writes == []
+
+
+def test_pr_number_change_is_rejected_without_writes():
+    api = MemoryGitHub()
+    api.publish(BASE_SHA, REPLACEMENT.encode())
+    original = api.call
+
+    def call(method, path='', body=None, query=None):
+        if (method, path) == ('GET', '/pulls'):
+            return [{'number': 2}]
+        return original(method, path, body, query)
+
+    api.call = call
+    with pytest.raises(ValueError, match='PR number changed'):
+        api.publish(BASE_SHA, REPLACEMENT.encode())
+    assert len(api.writes) == 3

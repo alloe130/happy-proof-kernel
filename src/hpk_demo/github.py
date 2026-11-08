@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
+import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,13 +37,17 @@ class GitHubError(Exception):
         self.status = status
 
 
+class ManualReviewRequired(ValueError):
+    """A write cannot safely be repeated without operator reconciliation."""
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 
 
 class GitHub:
-    def __init__(self, token, repo, branch, audit_path=None):
+    def __init__(self, token, repo, branch, audit_path=None, state_path=None):
         validate_target(repo, branch)
         if not token.startswith("github_pat_"):
             raise ValueError("Use a repository-scoped, fine-grained GitHub token")
@@ -49,6 +56,39 @@ class GitHub:
         self.token = token
         self.opener = urllib.request.build_opener(NoRedirect())
         self.audit_path = audit_path
+        self.state_path = state_path
+        self.state = read(state_path) if state_path and state_path.exists() else {}
+
+    def remember(self, **values):
+        self.state.update(values)
+        if self.state_path is not None:
+            atomic(self.state_path, self.state)
+
+    def write_confirmed(self, method, endpoint, body, confirm):
+        # Persist intent before dispatch so a restarted bridge only reads it back.
+        self.remember(pending={"method": method, "endpoint": endpoint})
+        try:
+            self.call(method, endpoint, body)
+        except (GitHubError, OSError, http.client.HTTPException, json.JSONDecodeError):
+            # An independent read must establish the result of an ambiguous write.
+            pass
+        return self.confirm_write(confirm)
+
+    def confirm_write(self, confirm):
+        endpoint = self.state["pending"]["endpoint"]
+        try:
+            result = confirm()
+            if not result:
+                raise ValueError("Remote write outcome is not established")
+        except (
+            GitHubError, ValueError, OSError, http.client.HTTPException, LookupError, TypeError
+        ) as error:
+            self.remember(status="manual_review_required", reason=type(error).__name__)
+            raise ManualReviewRequired(
+                "manual_review_required: unresolved GitHub write at " + endpoint
+            ) from None
+        self.remember(pending=None, status="reconciled", reason=None)
+        return result
 
     def audit(self, method, endpoint, status, body):
         if self.audit_path is None:
@@ -83,13 +123,25 @@ class GitHub:
                 "User-Agent": "Happy-Proof-Kernel-Isolated-MCP-Test",
             },
         )
-        try:
-            with self.opener.open(req, timeout=12) as reply:
-                self.audit(method, endpoint, reply.status, body)
-                return json.load(reply)
-        except urllib.error.HTTPError as error:
-            self.audit(method, endpoint, error.code, body)
-            raise GitHubError(error.code, endpoint) from None
+        attempts = 3 if method == "GET" else 1
+        for attempt in range(attempts):
+            try:
+                with self.opener.open(req, timeout=4) as reply:
+                    self.audit(method, endpoint, reply.status, body)
+                    return json.load(reply)
+            except urllib.error.HTTPError as error:
+                self.audit(method, endpoint, error.code, body)
+                if (
+                    method != "GET"
+                    or error.code not in {502, 503, 504}
+                    or attempt + 1 == attempts
+                ):
+                    raise GitHubError(error.code, endpoint) from None
+            except (OSError, http.client.HTTPException, json.JSONDecodeError):
+                self.audit(method, endpoint, "transport_error", body)
+                if attempt + 1 == attempts:
+                    raise
+            time.sleep(0.2 * (attempt + 1))
 
     def optional(self, endpoint, query=None):
         try:
@@ -168,6 +220,8 @@ class GitHub:
         if len(prs) != 1:
             raise ValueError(f"Expected one matching GitHub PR; found {len(prs)}")
         pr_number = prs[0]["number"]
+        if self.state.get("pr_number") is not None and pr_number != self.state["pr_number"]:
+            raise ValueError("Recorded PR number changed")
         if number is not None and number != pr_number:
             raise ValueError("PR number changed")
         pr = self.call("GET", f"/pulls/{pr_number}")
@@ -180,6 +234,8 @@ class GitHub:
         ):
             raise ValueError("PR does not bind to the exact fixture branch and base")
         head = pr["head"]["sha"]
+        if self.state.get("head_sha") and head != self.state["head_sha"]:
+            raise ValueError("Recorded PR head SHA changed")
         if self.head(self.branch) != head:
             raise ValueError("Remote branch and PR head differ")
         commits = self.call("GET", f"/pulls/{pr_number}/commits")
@@ -193,6 +249,8 @@ class GitHub:
         if [entry["filename"] for entry in files] != [PATH]:
             raise ValueError("Unexpected changed files")
         _, content = self.file(head)
+        if content is None:
+            raise ValueError("Remote fixture file is missing")
         return {
             "repo": self.repo,
             "pr_number": pr_number,
@@ -205,60 +263,128 @@ class GitHub:
             "replacement_sha256": hashlib.sha256(content).hexdigest(),
         }
 
-    def publish(self, base, replacement):
+    def candidate_head(self, base, replacement):
+        head = self.head(self.branch)
+        if not head or head == base:
+            return None
+        pinned = self.state.get("head_sha")
+        if pinned and pinned != head:
+            raise ValueError("Remote candidate SHA changed")
+        commit = self.call("GET", "/commits/" + head)
+        if commit["sha"] != head or [p["sha"] for p in commit["parents"]] != [base]:
+            raise ValueError("Candidate is not one direct child of the pinned base")
+        files = [(entry["filename"], entry["status"]) for entry in commit.get("files", [])]
+        if files != [(PATH, "modified")]:
+            raise ValueError("Candidate changes files outside the authorized edit")
+        _, current = self.file(head)
+        if current != replacement:
+            raise ValueError("Refusing to overwrite a different remote commit")
+        self.remember(head_sha=head)
+        return head
+
+    def validate_base(self, base):
         self.validate_repo()
         if self.head("main") != base:
             raise ValueError("The GitHub base advanced")
+
+    def confirm_branch(self, base):
+        if self.head(self.branch) != base:
+            return False
+        self.remember(branch_confirmed=True)
+        return True
+
+    def confirm_pr(self, base, replacement_digest):
+        if not self.state.get("head_sha"):
+            raise ValueError("Missing pinned candidate SHA")
+        observed = self.observe(base)
+        if observed["replacement_sha256"] != replacement_digest:
+            raise ValueError("Remote replacement differs from authorized bytes")
+        self.remember(pr_number=observed["pr_number"])
+        return observed
+
+    def publish(self, base, replacement):
+        digest = hashlib.sha256(replacement).hexdigest()
+        plan = {"repo": self.repo, "branch": self.branch, "base": base, "sha256": digest}
+        if self.state.get("plan", plan) != plan:
+            raise ValueError("Refusing to overwrite a different publication plan")
+
+        pending = self.state.get("pending")
+        if pending:
+            def confirm_pending():
+                self.validate_base(base)
+                if pending == {"method": "POST", "endpoint": "/git/refs"}:
+                    return self.confirm_branch(base)
+                if pending == {"method": "PUT", "endpoint": "/contents/" + PATH}:
+                    return self.candidate_head(base, replacement)
+                if pending == {"method": "POST", "endpoint": "/pulls"}:
+                    return self.confirm_pr(base, digest)
+                raise ValueError("Unrecognized pending write")
+
+            result = self.confirm_write(confirm_pending)
+            if "plan" not in self.state:
+                self.remember(plan=plan)
+            if pending["endpoint"] == "/pulls":
+                return result
+        else:
+            self.validate_base(base)
+            if "plan" not in self.state:
+                self.remember(plan=plan)
+
         head = self.head(self.branch)
+        if self.state.get("head_sha") and head != self.state["head_sha"]:
+            raise ValueError("Remote candidate SHA changed")
+        if self.state.get("pr_number") is not None:
+            return self.confirm_pr(base, digest)
         if head is None:
-            try:
-                self.call(
-                    "POST",
-                    "/git/refs",
-                    {"ref": "refs/heads/" + self.branch, "sha": base},
-                )
-            except GitHubError as error:
-                if error.status != 422 or self.head(self.branch) is None:
-                    raise
-            head = self.head(self.branch)
-        digest, current = self.file(head)
+            if self.state.get("branch_confirmed"):
+                raise ValueError("The confirmed GitHub branch is missing")
+            self.write_confirmed(
+                "POST", "/git/refs",
+                {"ref": "refs/heads/" + self.branch, "sha": base},
+                lambda: self.confirm_branch(base),
+            )
+            head = base
+        blob_sha, current = self.file(head)
         if head == base and current == ORIGINAL:
-            self.call(
-                "PUT",
-                "/contents/" + PATH,
+            self.write_confirmed(
+                "PUT", "/contents/" + PATH,
                 {
-                    "branch": self.branch,
-                    "sha": digest,
+                    "branch": self.branch, "sha": blob_sha,
                     "message": "Fix slug normalization via HPK",
                     "content": base64.b64encode(replacement).decode(),
                 },
+                lambda: self.candidate_head(base, replacement),
             )
-        elif current != replacement:
+        elif not self.candidate_head(base, replacement):
             raise ValueError("Refusing to overwrite a different remote commit")
         prs = self.matching_prs()
         if not prs:
-            try:
-                self.call(
-                    "POST",
-                    "/pulls",
-                    {
-                        "base": "main",
-                        "head": self.branch,
-                        "title": "Fix slug normalization (HPK MCP test)",
-                        "body": "Synthetic, isolated MCP handoff verification fixture.",
-                    },
-                )
-            except GitHubError as error:
-                if error.status != 422 or not self.matching_prs():
-                    raise
-        observed = self.observe(base)
-        if observed["replacement_sha256"] != hashlib.sha256(replacement).hexdigest():
-            raise ValueError("Remote replacement differs from authorized bytes")
-        return observed
+            if self.head(self.branch) != self.state["head_sha"] or self.head("main") != base:
+                raise ValueError("Remote branch changed before PR creation")
+            return self.write_confirmed(
+                "POST", "/pulls",
+                {
+                    "base": "main", "head": self.branch,
+                    "title": "Fix slug normalization (HPK MCP test)",
+                    "body": "Synthetic, isolated MCP handoff verification fixture.",
+                },
+                lambda: self.confirm_pr(base, digest),
+            )
+        return self.confirm_pr(base, digest)
 
 
 def service_requests(root, api, base):
     """Process only the two supported operations through a local one-run queue."""
+    if api.state_path is None:
+        api.state_path = root / "github-write-state.json"
+    # All workers sharing this run must refresh state while holding the same lock.
+    with (root / "github-bridge.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        api.state = read(api.state_path) if api.state_path.exists() else {}
+        service_locked_queue(root, api, base)
+
+
+def service_locked_queue(root, api, base):
     for request in sorted((root / "queue").glob("*.request.json")):
         response = request.with_name(
             request.name.replace(".request.json", ".response.json")
@@ -275,8 +401,13 @@ def service_requests(root, api, base):
             else:
                 raise ValueError("Unknown bridge operation")
             result = {"ok": True, "value": value}
-        except (GitHubError, ValueError, OSError) as error:
-            result = {"ok": False, "error": str(error)}
+        except (GitHubError, ValueError, OSError, http.client.HTTPException) as error:
+            result = {
+                "ok": False, "error": str(error),
+                "status": "manual_review_required" if api.state.get("pending") else "blocked",
+                "code": "github_manual_review_required" if api.state.get("pending") else "github_blocked",
+                "endpoint": (api.state.get("pending") or {}).get("endpoint"),
+            }
         atomic(response, result)
 
 
@@ -295,6 +426,7 @@ def main():
         target["repo"],
         target["branch"],
         args.state_dir / "github-api-events.jsonl",
+        state_path=args.state_dir / "github-write-state.json",
     )
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline:

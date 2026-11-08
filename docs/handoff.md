@@ -17,3 +17,33 @@ The handoff combines two records:
 The driver injects a tool error after GitHub publication and handoff state are recorded. With identical inputs, a publication retry reads back the same PR and returns `already_published`. After the verifier records a successful protected check, an identical verification retry reads GitHub again and returns `already_verified` without another check dispatch.
 
 The protected check outcome is recorded in the kernel ledger and the result file. It does not create a GitHub review comment or merge the PR. The preview exercises one run on one machine. It does not guarantee recovery from every network failure, a process exit before the checkpoint, or competing writers outside the demo.
+
+
+## Local retry hardening (post-preview)
+
+GET requests make at most three attempts, with a four-second socket timeout
+per attempt and 0.2/0.4-second backoff. Transport failures, incomplete/invalid
+JSON replies, and HTTP 502/503/504 are retried. Other HTTP errors fail immediately;
+404 remains an optional-read absence. This is not an end-to-end deadline: a
+publication performs several reads and the MCP bridge still has its own timeout.
+
+Publication POST/PUT requests are sent once. Before each mutation the bridge
+persists a pending intent in the private run's `github-write-state.json`. It then
+independently reads the branch, candidate ancestry and bytes, or PR to confirm the
+outcome, including after a lost response. A candidate must be one direct child of
+the pinned base. Its SHA and the resulting PR number are retained; a replay may
+not substitute another SHA even if its file bytes match.
+
+If read-back cannot establish the write outcome, the intent remains pending and
+the bridge responds with `github_manual_review_required` and
+`manual_review_required`. An identical retry, including after a bridge restart,
+checks that pending operation with GitHub reads. When the exact result is
+confirmed, the bridge records it and resumes. If the evidence is absent,
+unreadable, or different, the bridge retains the pending intent for manual
+review. A missing result does not authorize another mutation.
+
+Bridge workers on one macOS or Linux host sharing the same private run directory
+hold an exclusive file lock while they reload state and serve queued requests.
+Keep the run state and its lock together. Separate directories, multiple hosts,
+and unrelated GitHub writers are outside this protection. Initial `main` fixture
+seeding is separate from publication.
