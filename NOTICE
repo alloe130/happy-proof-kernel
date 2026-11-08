@@ -1,0 +1,16 @@
+HappyLM is an independent language-model research project.
+
+No proprietary model weights, tokenizer files, training outputs, source code,
+trademarks, private datasets, or API-output imitation corpora from Meta,
+Anthropic, OpenAI, or Google are included in this repository.
+
+The initial architecture is independently implemented from public research on
+decoder-only Transformers, rotary position embeddings, grouped-query
+attention, RMS normalization, and SwiGLU feed-forward networks.
+
+PyTorch TorchTitan is used as a public research reference for future scalable
+training integration. TorchTitan is distributed under the BSD 3-Clause
+License and is not bundled in this initial repository.
+
+HappyLM is not affiliated with, sponsored by, or endorsed by Meta Platforms,
+Anthropic, OpenAI, or Google.

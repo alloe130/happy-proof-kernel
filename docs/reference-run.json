@@ -1,0 +1,20 @@
+{
+  "schema": "hpk-demo.public-reference-summary/v1",
+  "source": "Redacted operator-observed remote integration run on 2026-11-08",
+  "github": "Real private GitHub test repository",
+  "transport": "Remote HTTPS Streamable HTTP MCP",
+  "oauth": {
+    "grant": "client_credentials",
+    "jwt_algorithm": "RS256",
+    "unauthenticated_http": 401,
+    "invalid_token_http": 401,
+    "claude_publish_denied": true
+  },
+  "gpt_retry": "already_published",
+  "claude_first": "verified",
+  "claude_retry": "already_verified",
+  "matching_pull_requests": 1,
+  "pr_change_commits": 1,
+  "protected_check_dispatches": 1,
+  "scope": "The original live harness was exercised with real model clients and GitHub. This summary is not a signature or a claim that every installation has run the demo."
+}
